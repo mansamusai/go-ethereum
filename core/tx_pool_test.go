@@ -29,9 +29,11 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/event"
 	"github.com/ethereum/go-ethereum/params"
@@ -67,6 +69,22 @@ func (bc *testBlockChain) CurrentBlock() *types.Block {
 	return types.NewBlock(&types.Header{
 		GasLimit: atomic.LoadUint64(&bc.gasLimit),
 	}, nil, nil, nil, trie.NewStackTrie(nil))
+}
+
+func (bc *testBlockChain) Engine() consensus.Engine {
+	return nil
+}
+
+func (bc *testBlockChain) GetHeader(common.Hash, uint64) *types.Header {
+	return nil
+}
+
+func (bc *testBlockChain) GetBlocksFromHash(hash common.Hash, n int) (blocks []*types.Block) {
+	return []*types.Block{}
+}
+
+func (bc *testBlockChain) GetVMConfig() *vm.Config {
+	return nil
 }
 
 func (bc *testBlockChain) GetBlock(hash common.Hash, number uint64) *types.Block {
