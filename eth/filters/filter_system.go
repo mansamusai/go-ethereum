@@ -75,6 +75,7 @@ type subscription struct {
 	logsCrit  ethereum.FilterQuery
 	logs      chan []*types.Log
 	hashes    chan []common.Hash
+	receipts  chan *types.Receipt
 	headers   chan *types.Header
 	installed chan struct{} // closed when the filter is installed
 	err       chan error    // closed when the filter is uninstalled
@@ -88,20 +89,22 @@ type EventSystem struct {
 	lastHead  *types.Header
 
 	// Subscriptions
-	txsSub         event.Subscription // Subscription for new transaction event
-	logsSub        event.Subscription // Subscription for new log event
-	rmLogsSub      event.Subscription // Subscription for removed log event
-	pendingLogsSub event.Subscription // Subscription for pending log event
-	chainSub       event.Subscription // Subscription for new chain event
+	txsSub             event.Subscription // Subscription for new transaction event
+	logsSub            event.Subscription // Subscription for new log event
+	rmLogsSub          event.Subscription // Subscription for removed log event
+	pendingLogsSub     event.Subscription // Subscription for pending log event
+	chainSub           event.Subscription // Subscription for new chain event
+	pendingReceiptsSub event.Subscription
 
 	// Channels
-	install       chan *subscription         // install filter for event notification
-	uninstall     chan *subscription         // remove filter for event notification
-	txsCh         chan core.NewTxsEvent      // Channel to receive new transactions event
-	logsCh        chan []*types.Log          // Channel to receive new log event
-	pendingLogsCh chan []*types.Log          // Channel to receive new log event
-	rmLogsCh      chan core.RemovedLogsEvent // Channel to receive removed log event
-	chainCh       chan core.ChainEvent       // Channel to receive new chain event
+	install           chan *subscription    // install filter for event notification
+	uninstall         chan *subscription    // remove filter for event notification
+	txsCh             chan core.NewTxsEvent // Channel to receive new transactions event
+	logsCh            chan []*types.Log     // Channel to receive new log event
+	pendingLogsCh     chan []*types.Log     // Channel to receive new log event
+	pendingReceiptsCh chan []*types.Receipt
+	rmLogsCh          chan core.RemovedLogsEvent // Channel to receive removed log event
+	chainCh           chan core.ChainEvent       // Channel to receive new chain event
 }
 
 // NewEventSystem creates a new manager that listens for event on the given mux,
@@ -290,6 +293,23 @@ func (es *EventSystem) SubscribeNewHeads(headers chan *types.Header) *Subscripti
 	return es.subscribe(sub)
 }
 
+// SubscribePendingReceipts creates a subscription that writes receipts for pending transactions
+// that are simulated when they enter the TX pool.
+func (es *EventSystem) SubscribePendingReceipts(receipts chan *types.Receipt) *Subscription {
+	sub := &subscription{
+		id:        rpc.NewID(),
+		typ:       BlocksSubscription,
+		created:   time.Now(),
+		logs:      make(chan []*types.Log),
+		hashes:    make(chan []common.Hash),
+		headers:   make(chan *types.Header),
+		receipts:  receipts,
+		installed: make(chan struct{}),
+		err:       make(chan error),
+	}
+	return es.subscribe(sub)
+}
+
 // SubscribePendingTxs creates a subscription that writes transaction hashes for
 // transactions that enter the transaction pool.
 func (es *EventSystem) SubscribePendingTxs(hashes chan []common.Hash) *Subscription {
@@ -448,6 +468,7 @@ func (es *EventSystem) eventLoop() {
 		es.rmLogsSub.Unsubscribe()
 		es.pendingLogsSub.Unsubscribe()
 		es.chainSub.Unsubscribe()
+		es.pendingReceiptsSub.Unsubscribe()
 	}()
 
 	index := make(filterIndex)

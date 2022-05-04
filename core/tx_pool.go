@@ -18,12 +18,17 @@ package core
 
 import (
 	"errors"
+	"fmt"
 	"math"
 	"math/big"
 	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	mapset "github.com/deckarep/golang-set"
+	"github.com/ethereum/go-ethereum/consensus"
+	"github.com/ethereum/go-ethereum/core/vm"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/prque"
@@ -145,8 +150,11 @@ type blockChain interface {
 	CurrentBlock() *types.Block
 	GetBlock(hash common.Hash, number uint64) *types.Block
 	StateAt(root common.Hash) (*state.StateDB, error)
-
+	GetVMConfig() *vm.Config
 	SubscribeChainHeadEvent(ch chan<- ChainHeadEvent) event.Subscription
+	Engine() consensus.Engine
+	GetHeader(common.Hash, uint64) *types.Header
+	GetBlocksFromHash(hash common.Hash, n int) (blocks []*types.Block)
 }
 
 // TxPoolConfig are the configuration parameters of the transaction pool.
@@ -223,6 +231,22 @@ func (config *TxPoolConfig) sanitize() TxPoolConfig {
 	return conf
 }
 
+type environment struct {
+	signer types.Signer
+
+	state     *state.StateDB // apply state changes here
+	ancestors mapset.Set     // ancestor set (used for checking uncle parent validity)
+	family    mapset.Set     // family set (used for checking uncle invalidity)
+	tcount    int            // tx count in cycle
+	gasPool   *GasPool       // available gas used to pack transactions
+	coinbase  common.Address
+
+	header   *types.Header
+	txs      []*types.Transaction
+	receipts []*types.Receipt
+	uncles   map[common.Hash]*types.Header
+}
+
 // TxPool contains all currently known transactions. Transactions
 // enter the pool when they are received from the network or submitted
 // locally. They exit the pool when they are included in the blockchain.
@@ -236,6 +260,7 @@ type TxPool struct {
 	chain       blockChain
 	gasPrice    *big.Int
 	txFeed      event.Feed
+	receiptFeed event.Feed
 	scope       event.SubscriptionScope
 	signer      types.Signer
 	mu          sync.RWMutex
@@ -310,7 +335,6 @@ func NewTxPool(config TxPoolConfig, chainconfig *params.ChainConfig, chain block
 	// Start the reorg loop early so it can handle requests generated during journal loading.
 	pool.wg.Add(1)
 	go pool.scheduleReorgLoop()
-
 	// If local transactions and journaling is enabled, load from disk
 	if !config.NoLocals && config.Journal != "" {
 		pool.journal = newTxJournal(config.Journal)
@@ -327,8 +351,50 @@ func NewTxPool(config TxPoolConfig, chainconfig *params.ChainConfig, chain block
 	pool.chainHeadSub = pool.chain.SubscribeChainHeadEvent(pool.chainHeadCh)
 	pool.wg.Add(1)
 	go pool.loop()
+	go pool.EnableReceiptPeering()
 
 	return pool
+}
+
+// makeEnv creates a new environment for the sealing block.
+func (pool *TxPool) MakeEnv(parent *types.Block, header *types.Header, coinbase common.Address) (*environment, error) {
+	// Retrieve the parent state to execute on top and start a prefetcher for
+	// the miner to speed block sealing up a bit.
+	state, err := pool.chain.StateAt(parent.Root())
+	if err != nil {
+		// Note since the sealing block can be created upon the arbitrary parent
+		// block, but the state of parent block may already be pruned, so the necessary
+		// state recovery is needed here in the future.
+		//
+		// The maximum acceptable reorg depth can be limited by the finalised block
+		// somehow. TODO(rjl493456442) fix the hard-coded number here later.
+		log.Warn("Recovered mining state", "root", parent.Root(), "err", err)
+		return nil, err
+	}
+	state.StartPrefetcher("miner")
+
+	// Note the passed coinbase may be different with header.Coinbase.
+	env := &environment{
+		signer:    types.MakeSigner(params.AllEthashProtocolChanges, header.Number),
+		state:     state,
+		coinbase:  coinbase,
+		ancestors: mapset.NewSet(),
+		family:    mapset.NewSet(),
+		header:    header,
+		uncles:    make(map[common.Hash]*types.Header),
+		gasPool:   new(GasPool).AddGas(8000000),
+	}
+	// when 08 is processed ancestors contain 07 (quick block)
+	for _, ancestor := range pool.chain.GetBlocksFromHash(parent.Hash(), 7) {
+		for _, uncle := range ancestor.Uncles() {
+			env.family.Add(uncle.Hash())
+		}
+		env.family.Add(ancestor.Hash())
+		env.ancestors.Add(ancestor.Hash())
+	}
+	// Keep track of transactions which return errors so they can be removed
+	env.tcount = 0
+	return env, nil
 }
 
 // loop is the transaction pool's main event loop, waiting for and reacting to
@@ -429,6 +495,68 @@ func (pool *TxPool) Stop() {
 // starts sending event to the given channel.
 func (pool *TxPool) SubscribeNewTxsEvent(ch chan<- NewTxsEvent) event.Subscription {
 	return pool.scope.Track(pool.txFeed.Subscribe(ch))
+}
+
+// SubscribeNewTxsEvent registers a subscription of NewTxsEvent and
+// starts sending event to the given channel.
+func (pool *TxPool) SubscribePendingReceiptEvent(ch chan<- NewTxReceiptEvent) event.Subscription {
+	return pool.scope.Track(pool.receiptFeed.Subscribe(ch))
+}
+
+func (pool *TxPool) EnableReceiptPeering() {
+	newTxCh := make(chan NewTxsEvent)
+	pendingReceiptCh := make(chan NewTxReceiptEvent)
+	pool.SubscribeNewTxsEvent(newTxCh)
+	pool.SubscribePendingReceiptEvent(pendingReceiptCh)
+
+	go func() {
+		for {
+			select {
+			case txs := <-newTxCh:
+				pool.EvaluateTxsOpportunities(txs.Txs)
+			case receipt := <-pendingReceiptCh:
+				fmt.Println(receipt.Receipt.Logs)
+			}
+		}
+	}()
+}
+
+func (pool *TxPool) EvaluateTxsOpportunities(txs []*types.Transaction) {
+	for _, tx := range txs {
+		pool.EvaluateTxOpportunity(tx)
+	}
+}
+
+func (pool *TxPool) EvaluateTxOpportunity(tx *types.Transaction) {
+	parent := pool.chain.CurrentBlock()
+	num := parent.Number()
+	header := &types.Header{
+		ParentHash: parent.Hash(),
+		Number:     num.Add(num, common.Big1),
+		GasLimit:   CalcGasLimit(parent.GasLimit(), 8000000),
+		Time:       uint64(time.Now().Unix()),
+		Coinbase:   common.HexToAddress("0x1988739cfc2cd1d8372af0968e914b8c9492d63e"),
+	}
+	header.BaseFee = misc.CalcBaseFee(params.AllEthashProtocolChanges, parent.Header())
+	header.Difficulty = big.NewInt(0)
+	parentGasLimit := parent.GasLimit() * params.ElasticityMultiplier
+	header.GasLimit = CalcGasLimit(parentGasLimit, 8000000)
+	env, err := pool.MakeEnv(parent, header, common.HexToAddress("0x1988739cfc2cd1d8372af0968e914b8c9492d63e"))
+	if err != nil {
+		panic(err)
+	}
+	env.state.Prepare(tx.Hash(), env.tcount)
+	env.state.Snapshot()
+	snap := env.state.Snapshot()
+	fmt.Println("SNAPSHOT: ", snap)
+	result, err := ApplyTransaction(params.AllEthashProtocolChanges, pool.chain, &env.coinbase, env.gasPool, env.state, env.header, tx, &env.header.GasUsed, *pool.chain.GetVMConfig())
+	if err != nil {
+		log.Error(err.Error())
+		return
+	}
+	go pool.receiptFeed.Send(NewTxReceiptEvent{Receipt: result})
+	fmt.Println(env.state.GetBalance(common.HexToAddress("0xccc0ee4f8783d577366a04a13b1c3c0e4e183f73")), result.Logs)
+	log.Info("finished applying transaction")
 }
 
 // GasPrice returns the current gas price enforced by the transaction pool.
